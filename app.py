@@ -252,16 +252,16 @@ if submit_button:
         filter_tags = [tag.strip() for tag in tag_input.split(",") if tag.strip()]
 
         category_mapping = {
-            "Art": 21,
-            "Travel": 22,
-            "Entertainment": 23,
-            "Literature": 24,
-            "Books": 25,
-            "Sports": 26,
-            "History": 27,
-            "Culture": 28,
-            "Wildlife": 29,
-            "Spiritual": 30
+            "Art": 1,
+            "Travel": 2,
+            "Entertainment": 3,
+            "Literature": 4,
+            "Books": 5,
+            "Sports": 6,
+            "History": 7,
+            "Culture": 8,
+            "Wildlife": 9,
+            "Spiritual": 10
         }
 
         filternumber = category_mapping[categories]
@@ -379,7 +379,7 @@ if submit_button:
             "storyhtmlurl": canurl1,
             "urlslug": slug_nano,
             "cover_image_link": cover_image_url,
-            "publisher_id": 3,
+            "publisher_id": 1,
             "story_logo_link": "https://media.suvichaar.org/filters:resize/96x96/media/brandasset/suvichaariconblack.png",
             "keywords": meta_keywords,
             "metadescription": meta_description,
