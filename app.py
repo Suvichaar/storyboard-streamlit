@@ -53,8 +53,8 @@ s3_client = boto3.client(
     region_name=region_name,
 )
 
-# Slug and URL generator
-def generate_slug_and_urls(title):
+# ---------- Helpers ----------
+def generate_slug_and_urls(title: str):
     if not title or not isinstance(title, str):
         raise ValueError("Invalid title")
     slug = ''.join(
@@ -71,7 +71,101 @@ def generate_slug_and_urls(title):
         f"https://stories.suvichaar.org/{slug_nano}.html",
     )
 
-# Sidebar Chat
+def extract_json_block(text: str) -> str:
+    """
+    Extract the first valid JSON object from text (handles ```json fenced blocks).
+    Uses brace counting to find a balanced top-level object.
+    """
+    if not text:
+        raise ValueError("Empty generation output")
+
+    # Prefer fenced ```json ... ```
+    m = re.search(r"```json\s*(\{.*?\})\s*```", text, flags=re.DOTALL | re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+
+    # Brace-count scan for the first {...} block
+    s = text
+    start = s.find("{")
+    while start != -1:
+        depth = 0
+        for i in range(start, len(s)):
+            if s[i] == "{":
+                depth += 1
+            elif s[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    return s[start:i+1].strip()
+        # if not balanced, try the next '{'
+        start = s.find("{", start + 1)
+
+    # Last resort: assume whole text is JSON
+    return text.strip()
+
+def generate_metadata(title: str) -> dict:
+    """
+    Ask Azure OpenAI for strict JSON only:
+    {
+      "meta_description": "...",
+      "meta_keywords": ["...", "..."],
+      "filter_tags": ["...", "..."]
+    }
+    """
+    system = {
+        "role": "system",
+        "content": (
+            "You are an assistant that ONLY returns strict JSON. "
+            "Do not include explanations or markdown fences unless asked."
+        )
+    }
+    user = {
+        "role": "user",
+        "content": (
+            "For a web story, produce concise SEO metadata as strict JSON with keys:\n"
+            "meta_description (<= 160 chars), meta_keywords (array of 5–12 concise lowercase phrases), "
+            "filter_tags (array of 5–12 short tags). "
+            f"Title: {title}\n"
+            "Example format:\n"
+            "{\n"
+            "  \"meta_description\": \"...\",\n"
+            "  \"meta_keywords\": [\"...\", \"...\"],\n"
+            "  \"filter_tags\": [\"...\", \"...\"]\n"
+            "}\n"
+            "Return ONLY JSON."
+        )
+    }
+    resp = client.chat.completions.create(
+        model=GPT_DEPLOYMENT,
+        messages=[system, user],
+        max_tokens=300,
+        temperature=0.5,
+    )
+    raw = resp.choices[0].message.content
+    json_str = extract_json_block(raw)
+    data = json.loads(json_str)
+
+    # Normalize & coerce
+    desc = str(data.get("meta_description", "")).strip()
+    kws = data.get("meta_keywords", [])
+    tags = data.get("filter_tags", [])
+
+    if isinstance(kws, str):
+        kws_list = [x.strip() for x in kws.split(",") if x.strip()]
+    else:
+        kws_list = [str(x).strip() for x in kws if str(x).strip()]
+
+    if isinstance(tags, str):
+        tag_list = [x.strip() for x in tags.split(",") if x.strip()]
+    else:
+        tag_list = [str(x).strip() for x in tags if str(x).strip()]
+
+    return {
+        "meta_description": desc[:160],                 # soft cap ~160
+        "meta_keywords_csv": ", ".join(kws_list),
+        "filter_tags_csv": ", ".join(tag_list),
+    }
+
+# ---------- Sidebar Chat (RESTORED) ----------
 with st.sidebar:
     st.header("Azure OpenAI Chat")
     user_question = st.text_input("Your question:")
@@ -82,7 +176,7 @@ with st.sidebar:
             with st.spinner("Waiting for response..."):
                 messages = [{"role": "user", "content": user_question}]
                 response = client.chat.completions.create(
-                    model=GPT_DEPLOYMENT,      # <— use your deployment (e.g., gpt-5-chat)
+                    model=GPT_DEPLOYMENT,
                     messages=messages,
                     max_tokens=1500,
                     temperature=0.5,
@@ -90,93 +184,77 @@ with st.sidebar:
                 st.success("Answer:")
                 st.write(response.choices[0].message.content)
 
-# Content Submission Form
+# ---------- Main UI ----------
 st.title("Content Submission Form")
+
+# Session defaults
 if "last_title" not in st.session_state:
     st.session_state.last_title = ""
+if "meta_description" not in st.session_state:
     st.session_state.meta_description = ""
+if "meta_keywords" not in st.session_state:
     st.session_state.meta_keywords = ""
+if "generated_filter_tags" not in st.session_state:
+    st.session_state.generated_filter_tags = ""
 
-# Title input outside form for dynamic update
+# Title input (drives metadata generation)
 story_title = st.text_input("Story Title")
 
-# Auto-generate metadata if story_title changed
+# Auto-generate metadata when the title changes
 if story_title.strip() and story_title != st.session_state.last_title:
     with st.spinner("Generating meta description, keywords, and filter tags..."):
-        messages = [
-            {
-                "role": "user",
-                "content": f"""
-                Generate the following for a web story titled '{story_title}':
-                1. A short SEO-friendly meta description
-                2. Meta keywords (comma separated)
-                3. Relevant filter tags (comma separated, suitable for categorization and content filtering)"""
-            }
-        ]
         try:
-            response = client.chat.completions.create(
-                model=GPT_DEPLOYMENT,  # <— use your deployment
-                messages=messages,
-                max_tokens=300,
-                temperature=0.5,
-            )
-            output = response.choices[0].message.content
-
-            # Extract metadata using regex
-            desc = re.search(r"[Dd]escription\s*[:\-]\s*(.+)", output)
-            keys = re.search(r"[Kk]eywords\s*[:\-]\s*(.+)", output)
-            tags = re.search(r"[Ff]ilter\s*[Tt]ags\s*[:\-]\s*(.+)", output)
-
-            st.session_state.meta_description = desc.group(1).strip() if desc else ""
-            st.session_state.meta_keywords = keys.group(1).strip() if keys else ""
-            st.session_state.generated_filter_tags = tags.group(1).strip() if tags else ""
-
+            md = generate_metadata(story_title.strip())
+            st.session_state.meta_description = md["meta_description"]
+            st.session_state.meta_keywords = md["meta_keywords_csv"]
+            st.session_state.generated_filter_tags = md["filter_tags_csv"]
         except Exception as e:
-            st.warning(f"Error: {e}")
-        st.session_state.last_title = story_title
+            st.warning(f"Metadata generation failed: {e}")
+    st.session_state.last_title = story_title
 
 with st.form("content_form"):
-    meta_description = st.text_area("Meta Description", value=st.session_state.meta_description)
-    meta_keywords = st.text_input("Meta Keywords (comma separated)", value=st.session_state.meta_keywords)
+    # Prefilled + editable
+    meta_description = st.text_area(
+        "Meta Description",
+        value=st.session_state.meta_description,
+        help="Aim for ~150–160 characters."
+    )
+    meta_keywords = st.text_input(
+        "Meta Keywords (comma separated)",
+        value=st.session_state.meta_keywords
+    )
     content_type = st.selectbox("Select your contenttype", ["News", "Article"])
     language = st.selectbox("Select your Language", ["en-US", "hi"])
     image_url = st.text_input("Enter your Image URL")
     html_file = st.file_uploader("Upload your Raw HTML File", type=["html", "htm"])
-    categories = st.selectbox("Select your Categories", ["Art", "Travel", "Entertainment", "Literature", "Books", "Sports", "History", "Culture", "Wildlife", "Spiritual", "Food"])
+    categories = st.selectbox(
+        "Select your Categories",
+        ["Art", "Travel", "Entertainment", "Literature", "Books", "Sports", "History", "Culture", "Wildlife", "Spiritual", "Food"]
+    )
 
-    # Default tags if generator didn't fill
+    # Tags (prefilled from generator, still editable)
     default_tags = [
-        "Lata Mangeshkar",
-        "Indian Music Legends",
-        "Playback Singing",
-        "Bollywood Golden Era",
-        "Indian Cinema",
-        "Musical Icons",
-        "Voice of India",
-        "Bharat Ratna",
-        "Indian Classical Music",
-        "Hindi Film Songs",
-        "Legendary Singers",
-        "Cultural Heritage",
-        "Suvichaar Stories"
+        "Lata Mangeshkar", "Indian Music Legends", "Playback Singing", "Bollywood Golden Era",
+        "Indian Cinema", "Musical Icons", "Voice of India", "Bharat Ratna",
+        "Indian Classical Music", "Hindi Film Songs", "Legendary Singers",
+        "Cultural Heritage", "Suvichaar Stories"
     ]
-
     tag_input = st.text_input(
-        "Enter Filter Tags (comma separated):",
+        "Filter Tags (comma separated)",
         value=st.session_state.get("generated_filter_tags", ", ".join(default_tags)),
-        help="Example: Music, Culture, Lata Mangeshkar"
+        help="Example: music, culture, lata mangeshkar"
     )
 
     use_custom_cover = st.radio("Do you want to add a custom cover image URL?", ("No", "Yes"))
     if use_custom_cover == "Yes":
         cover_image_url = st.text_input("Enter your custom Cover Image URL")
     else:
-        cover_image_url = image_url  # fallback to image_url
+        cover_image_url = image_url  # fallback
 
     submit_button = st.form_submit_button("Submit")
 
 if submit_button:
-    # Validation before processing
+    # Validation
     missing_fields = []
     if not story_title.strip():      missing_fields.append("Story Title")
     if not meta_description.strip(): missing_fields.append("Meta Description")
@@ -191,7 +269,6 @@ if submit_button:
     if missing_fields:
         st.error("❌ Please fill all required fields before submitting:\n- " + "\n- ".join(missing_fields))
     else:
-        # ✅ All fields are valid, proceed with your full processing logic
         st.markdown("### Submitted Data")
         st.write(f"**Story Title:** {story_title}")
         st.write(f"**Meta Description:** {meta_description}")
@@ -217,11 +294,9 @@ if submit_button:
             ext = ".jpg"
 
         if image_url.startswith("https://stories.suvichaar.org/"):
-            # Already on our CDN (stories), use as-is
             uploaded_url = image_url
             key_path = "/".join(urlparse(image_url).path.split("/")[2:])
         else:
-            # Fetch and upload to S3 -> CDN URL
             try:
                 response = requests.get(image_url, timeout=10)
                 response.raise_for_status()
@@ -253,20 +328,11 @@ if submit_button:
             "Naman": "https://njnaman.in/"
         }
 
-        filter_tags = [tag.strip() for tag in tag_input.split(",") if tag.strip()]
+        filter_tags_list = [tag.strip() for tag in tag_input.split(",") if tag.strip()]
 
         category_mapping = {
-            "Art": 1,
-            "Travel": 2,
-            "Entertainment": 3,
-            "Literature": 4,
-            "Books": 5,
-            "Sports": 6,
-            "History": 7,
-            "Culture": 8,
-            "Wildlife": 9,
-            "Spiritual": 10,
-            "Food": 11
+            "Art": 1, "Travel": 2, "Entertainment": 3, "Literature": 4, "Books": 5,
+            "Sports": 6, "History": 7, "Culture": 8, "Wildlife": 9, "Spiritual": 10, "Food": 11
         }
 
         filternumber = category_mapping[categories]
@@ -311,20 +377,18 @@ if submit_button:
         html_template = re.sub(r'href="\{(https://[^}]+)\}"', r'href="\1"', html_template)
         html_template = re.sub(r'src="\{(https://[^}]+)\}"', r'src="\1"', html_template)
 
-        # ----------- Extract <style amp-custom> block from uploaded raw HTML -------------
+        # ----------- Extract <style amp-custom> + <amp-story-page> from uploaded raw HTML -------------
         extracted_style = ""
         extracted_amp_story = ""
         if html_file:
             raw_html = html_file.read().decode("utf-8")
 
-            # Extract <style amp-custom> block
             style_match = re.search(r"(<style\s+amp-custom[^>]*>.*?</style>)", raw_html, re.DOTALL | re.IGNORECASE)
             if style_match:
                 extracted_style = style_match.group(1)
             else:
                 st.info("No <style amp-custom> block found in uploaded HTML.")
 
-            # Extract <amp-story-page> block(s)
             start = raw_html.find("<amp-story-page")
             end = raw_html.rfind("</amp-story-page>")
             if start != -1 and end != -1:
@@ -332,7 +396,6 @@ if submit_button:
             else:
                 st.warning("No complete <amp-story> block found in uploaded HTML.")
 
-        # Insert extracted <style amp-custom> into <head> of your template before </head>
         if extracted_style:
             head_close_pos = html_template.lower().find("</head>")
             if head_close_pos != -1:
@@ -342,7 +405,6 @@ if submit_button:
             else:
                 st.warning("No </head> tag found in HTML template to insert <style amp-custom>.")
 
-        # Insert extracted AMP story block inside template (after opening <amp-story>)
         if extracted_amp_story:
             amp_story_opening_match = re.search(r"<amp-story\b[^>]*>", html_template)
             analytics_tag = '<amp-story-auto-analytics gtag-id="G-2D5GXVRK1E" class="i-amphtml-layout-container" i-amphtml-layout="container"></amp-story-auto-analytics>'
@@ -359,11 +421,10 @@ if submit_button:
                 st.warning("Could not find insertion points in the HTML template.")
 
         # ----------- Generate and Provide Metadata JSON -------------
-        filter_tags = [tag.strip() for tag in tag_input.split(",") if tag.strip()]
         metadata_dict = {
             "story_title": story_title,
             "categories": filternumber,
-            "filterTags": filter_tags,
+            "filterTags": filter_tags_list,
             "story_uid": nano,
             "story_link": canurl,
             "storyhtmlurl": canurl1,
@@ -379,7 +440,7 @@ if submit_button:
         # Upload HTML to S3 (stories bucket is distinct from media bucket)
         s3_key = f"{slug_nano}.html"
         s3_client.put_object(
-            Bucket="suvichaarstories",  # <-- if you want to use the same bucket as media, replace with bucket_name
+            Bucket="suvichaarstories",  # <-- replace with bucket_name if you want same bucket as media
             Key=s3_key,
             Body=html_template.encode("utf-8"),
             ContentType="text/html",
